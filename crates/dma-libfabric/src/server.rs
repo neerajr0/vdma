@@ -109,6 +109,15 @@ pub enum WorkerMessage<TContext> {
     },
 }
 
+/// Information sent from the worker thread when the endpoint is ready.
+#[derive(Debug, Clone)]
+pub(crate) struct EndpointReadyInfo {
+    /// The endpoint's fabric address.
+    pub address: Vec<u8>,
+    /// Ack buffer descriptor for client acknowledgements, if available.
+    pub ack_buffer: Option<crate::endpoint::AckBufferInfo>,
+}
+
 /// A sideband an rpc server uses to implement data-transfer commands over a faster transport. It
 /// does no rpc of its own.
 ///
@@ -121,6 +130,8 @@ pub struct FabricService<TContext: Send + 'static> {
     /// hold the initiator's address, so a client inserts this into its own address vector before the
     /// server RMAs against it, learning it via [`Self::local_address`] in the `dma.hello` exchange.
     address: Vec<u8>,
+    /// Ack buffer descriptor for client acknowledgements.
+    ack_buffer: Option<crate::endpoint::AckBufferInfo>,
     /// Submitted but not yet finished, counting queued ops as well as posted ones so the depth of
     /// this device's backlog is visible to a caller balancing across devices. Shared with the worker,
     /// which decrements as each op finishes.
@@ -174,10 +185,11 @@ impl<TContext: Send + 'static> FabricService<TContext> {
             })
             .map_err(|error| DmaError::Fabric(format!("failed to spawn fabric worker: {error}")))?;
         match ready.wait() {
-            Some(Ok(address)) => Ok(Self {
+            Some(Ok(info)) => Ok(Self {
                 sender: Some(sender),
                 dma_worker_handle: Some(handle),
-                address,
+                address: info.address,
+                ack_buffer: info.ack_buffer,
                 outstanding,
             }),
             Some(Err(error)) => {
@@ -195,6 +207,12 @@ impl<TContext: Send + 'static> FabricService<TContext> {
     /// address vector. This side initiates every dma itself.
     pub fn local_address(&self) -> &[u8] {
         &self.address
+    }
+
+    /// The ack buffer descriptor clients use to send acknowledgements back to this server.
+    /// Returns `None` if ack buffer registration failed.
+    pub fn ack_buffer_info(&self) -> Option<crate::endpoint::AckBufferInfo> {
+        self.ack_buffer
     }
 
     /// Transfers submitted here but not yet finished, queued and posted alike. The load signal a

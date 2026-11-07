@@ -196,6 +196,12 @@ impl<TContext: Operands + Send + 'static> FabricService<TContext> {
         self.inner.local_address()
     }
 
+    /// The ack buffer descriptor clients use to send acknowledgements back to this server.
+    /// Returns `None` if ack buffer registration failed.
+    pub fn ack_buffer_info(&self) -> Option<crate::endpoint::AckBufferInfo> {
+        self.inner.ack_buffer_info()
+    }
+
     /// Count of submitted but unfinished transfers.
     pub fn outstanding(&self) -> usize {
         self.inner.outstanding()

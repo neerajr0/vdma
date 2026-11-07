@@ -15,35 +15,44 @@ pub enum Provider {
     /// `FI_CONTEXT2` — see `server_dma_worker::InFlight` for how that is satisfied.
     #[serde(rename = "efa-direct")]
     EfaDirect,
+    /// The EFA provider's rxr (reliable datagram) fabric, which implements wire protocols for
+    /// features beyond device capabilities. This includes software-level delivery acknowledgment
+    /// via RECEIPT packets and the "unsolicited write recv" feature (libfabric 1.22+) that allows
+    /// `FI_REMOTE_CQ_DATA` without posted receive buffers. Use this when you need confirmed data
+    /// visibility at the remote endpoint.
+    #[serde(rename = "efa")]
+    Efa,
 }
 
 impl Provider {
-    /// The `fi_fabric_attr.prov_name`. `EfaDirect` shares the `efa` provider and is distinguished by
-    /// [`Self::fabric_name`].
+    /// The `fi_fabric_attr.prov_name`. Both `Efa` and `EfaDirect` share the `efa` provider and are
+    /// distinguished by [`Self::fabric_name`].
     pub fn as_str(self) -> &'static str {
         match self {
             Provider::Tcp => "tcp",
-            Provider::EfaDirect => "efa",
+            Provider::EfaDirect | Provider::Efa => "efa",
         }
     }
 
     /// The `fi_fabric_attr.name` to pin when the provider alone doesn't disambiguate. One `efa`
-    /// provider exposes both the rxr software `efa` fabric and the device-RMA `efa-direct` one, so
-    /// selecting hardware RDMA means pinning the fabric name.
+    /// provider exposes both the rxr software `efa` fabric and the device-RMA `efa-direct` one.
+    /// Pinning the fabric name ensures consistent selection across libfabric versions (2.6 returns
+    /// only `efa`, 2.7+ returns `efa-direct` first).
     pub fn fabric_name(self) -> Option<&'static str> {
         match self {
             Provider::EfaDirect => Some("efa-direct"),
-            _ => None,
+            Provider::Efa => Some("efa"),
+            Provider::Tcp => None,
         }
     }
 
     /// The `fi_info.mode` bits the provider mandates; `fi_getinfo` skips a fabric whose required
     /// mode the hints don't accept. efa-direct needs `FI_CONTEXT2`, a provider-owned `fi_context2`
     /// as each op's `op_context`, and to support rdma-core versions before 52, `FI_RX_CQ_DATA`.
-    /// Remote CQ data is not applicable to dma-libfabric, but the support declaration is required.
+    /// The rxr `efa` fabric does not require these mode bits.
     pub fn required_mode(self) -> u64 {
         match self {
-            Provider::Tcp => 0,
+            Provider::Tcp | Provider::Efa => 0,
             Provider::EfaDirect => FI_CONTEXT2 | FI_RX_CQ_DATA,
         }
     }

@@ -6,16 +6,39 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::sys::{
     FI_EAGAIN, FI_EAVAIL, FI_MR_ALLOCATED, FI_MR_ENDPOINT, FI_MR_HMEM, FI_MR_LOCAL, FI_MR_PROV_KEY,
-    FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA, FI_SOURCE,
-    FI_TRANSMIT, FI_WRITE, fi_allocinfo, fi_av_attr, fi_av_open, fi_av_type_FI_AV_MAP, fi_cq_attr,
-    fi_cq_entry, fi_cq_err_entry, fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read,
-    fi_cq_readerr, fi_domain, fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM,
-    fi_fabric, fi_freeinfo, fi_getinfo, fi_getname, fi_info, fi_version, fid_av, fid_cq,
-    fid_domain, fid_ep, fid_fabric,
+    FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV, FI_REMOTE_CQ_DATA, FI_REMOTE_READ, FI_REMOTE_WRITE,
+    FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_allocinfo, fi_av_attr, fi_av_open,
+    fi_av_type_FI_AV_MAP, fi_cq_attr, fi_cq_data_entry, fi_cq_err_entry,
+    fi_cq_format_FI_CQ_FORMAT_DATA, fi_cq_open, fi_cq_read, fi_cq_readerr, fi_domain, fi_dupinfo,
+    fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo, fi_getinfo,
+    fi_getname, fi_info, fi_mr_key, fi_mr_reg, fi_version, fid_av, fid_cq, fid_domain, fid_ep,
+    fid_fabric, fid_mr,
 };
 use dma_libfabric_protocol::DmaError;
+
+/// Magic value sent as immediate data in ack completions. Clients send this to signal they have
+/// received all data; servers poll for it before replying OK.
+pub const ACK_MAGIC: u64 = 0xACACACAC;
+
+/// Size of the ack buffer. Small and fixed — clients write a tiny payload with the real signal
+/// carried in the immediate data field.
+const ACK_BUFFER_SIZE: usize = 8;
+
+/// Descriptor for a remotely-writable ack buffer. Returned by [`LibfabricEndpoint::ack_buffer_info`]
+/// and advertised to clients so they can send acknowledgements back to the server.
+#[derive(Debug, Clone, Copy)]
+pub struct AckBufferInfo {
+    /// The remote key for the ack buffer registration.
+    pub rkey: u64,
+    /// The remote address (virtual address on FI_MR_VIRT_ADDR providers, 0 otherwise).
+    pub remote_addr: u64,
+    /// The buffer length.
+    pub len: usize,
+}
 
 use crate::configuration::{Configuration, Provider};
 use crate::connection::LibfabricConnection;
@@ -55,6 +78,17 @@ pub struct LibfabricEndpoint {
     local_regions: LocalRegions,
     /// Address-vector entries, shared between clients advertising the same address.
     peer_addresses: PeerAddresses,
+    /// A small buffer registered for remote write access, so clients can send acknowledgements.
+    /// The buffer itself is boxed to keep its address stable.
+    ack_buffer: Option<Box<[u8; ACK_BUFFER_SIZE]>>,
+    /// Memory region handle for the ack buffer. Closed on drop before the domain.
+    ack_buffer_mr: *mut fid_mr,
+    /// Cached ack buffer info (rkey, remote_addr) for advertisement to clients.
+    ack_buffer_info: Option<AckBufferInfo>,
+    /// Monotonic counter for generating unique transfer IDs. Used as immediate data in
+    /// FI_REMOTE_CQ_DATA writes so clients can echo it back in acks for correlation.
+    /// Wraps at u32::MAX, which is fine — collisions require 4B concurrent in-flight transfers.
+    transfer_seq: AtomicU32,
 }
 
 /// Build the configured provider's hints and run `fi_getinfo`. The caller selects an entry from the
@@ -168,6 +202,10 @@ impl LibfabricEndpoint {
             max_tx: 0,
             local_regions: LocalRegions::new(ptr::null_mut()),
             peer_addresses: PeerAddresses::new(ptr::null_mut(), AddressFormat::Opaque),
+            ack_buffer: None,
+            ack_buffer_mr: ptr::null_mut(),
+            ack_buffer_info: None,
+            transfer_seq: AtomicU32::new(1), // Start at 1 so 0 can mean "no transfer"
         };
 
         let list = query_info(configuration, source_node)?;
@@ -234,7 +272,10 @@ impl LibfabricEndpoint {
             );
 
             let mut cq_attr: fi_cq_attr = std::mem::zeroed();
-            cq_attr.format = fi_cq_format_FI_CQ_FORMAT_CONTEXT;
+            // Use FI_CQ_FORMAT_DATA to receive immediate data from FI_REMOTE_CQ_DATA writes.
+            // This format includes the `data` field that carries the immediate value the remote
+            // sender passed to fi_writemsg with FI_REMOTE_CQ_DATA.
+            cq_attr.format = fi_cq_format_FI_CQ_FORMAT_DATA;
             check(
                 fi_cq_open(
                     endpoint.domain,
@@ -267,6 +308,40 @@ impl LibfabricEndpoint {
                 "fi_ep_bind(cq)",
             )?;
             check(fi_enable(endpoint.endpoint), "fi_enable")?;
+
+            // Register a small ack buffer for remote write access. Clients send an
+            // fi_writemsg with FI_REMOTE_CQ_DATA to this buffer to acknowledge they
+            // received data; the server polls poll_remote_completions() for ACK_MAGIC.
+            let ack_buf = Box::new([0u8; ACK_BUFFER_SIZE]);
+            let ack_ptr = ack_buf.as_ptr();
+            let mut ack_mr: *mut fid_mr = ptr::null_mut();
+            check(
+                fi_mr_reg(
+                    endpoint.domain,
+                    ack_ptr.cast::<c_void>(),
+                    ACK_BUFFER_SIZE,
+                    u64::from(FI_REMOTE_WRITE | FI_WRITE),
+                    0,
+                    0, // requested_key — provider assigns on FI_MR_PROV_KEY
+                    0,
+                    &mut ack_mr,
+                    ptr::null_mut(),
+                ),
+                "fi_mr_reg(ack_buffer)",
+            )?;
+            let rkey = fi_mr_key(ack_mr);
+            let remote_addr = if endpoint.uses_virtual_addressing {
+                ack_ptr as u64
+            } else {
+                0 // offset-based addressing
+            };
+            endpoint.ack_buffer = Some(ack_buf);
+            endpoint.ack_buffer_mr = ack_mr;
+            endpoint.ack_buffer_info = Some(AckBufferInfo {
+                rkey,
+                remote_addr,
+                len: ACK_BUFFER_SIZE,
+            });
         }
 
         Ok(endpoint)
@@ -275,6 +350,19 @@ impl LibfabricEndpoint {
     /// Outstanding transmit operations before the provider returns `-FI_EAGAIN`.
     pub fn max_tx(&self) -> usize {
         self.max_tx
+    }
+
+    /// The ack buffer descriptor for this endpoint, or `None` if registration failed.
+    /// Clients use this to send acknowledgements back to the server via fi_writemsg
+    /// with FI_REMOTE_CQ_DATA.
+    pub fn ack_buffer_info(&self) -> Option<AckBufferInfo> {
+        self.ack_buffer_info
+    }
+
+    /// Generate a unique transfer ID for use as immediate data in FI_REMOTE_CQ_DATA writes.
+    /// Clients echo this back in their ack for correlation. Wraps at u32::MAX.
+    pub fn next_transfer_id(&self) -> u32 {
+        self.transfer_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Reap ready completions, appending `(op_context, result)` to `out` up to `max` or until the
@@ -290,32 +378,84 @@ impl LibfabricEndpoint {
         out: &mut Vec<(*mut c_void, Result<(), DmaError>)>,
         max: usize,
     ) -> Result<(), DmaError> {
+        self.reap_all(out, &mut Vec::new(), max)
+    }
+
+    /// Reap ready completions into two output vectors:
+    /// - `local_out`: local operation completions (our posted writes/reads completing)
+    /// - `ack_out`: remote ack completions (client's FI_REMOTE_CQ_DATA writes with transfer_id)
+    ///
+    /// Both types come from the same CQ in a single `fi_cq_read` pass, distinguished by:
+    /// - Local completions have non-null `op_context`
+    /// - Remote acks have `FI_REMOTE_CQ_DATA` flag and null `op_context`
+    ///
+    /// The `data` field of ack completions contains the `transfer_id` the client echoed back.
+    pub fn reap_all(
+        &self,
+        local_out: &mut Vec<(*mut c_void, Result<(), DmaError>)>,
+        ack_out: &mut Vec<u32>,
+        max: usize,
+    ) -> Result<(), DmaError> {
         const BATCH: usize = 16;
         let again = -(FI_EAGAIN as isize);
         // Only `-FI_EAVAIL` promises an entry in the error queue. Any other negative is a failure of
         // the queue itself, with nothing for `fi_cq_readerr` to return.
         let available = -(FI_EAVAIL as isize);
-        while out.len() < max {
-            let mut entries: [fi_cq_entry; BATCH] = std::array::from_fn(|_| fi_cq_entry {
-                op_context: ptr::null_mut(),
-            });
-            let want = BATCH.min(max - out.len());
+        let mut total_reaped = 0usize;
+        while total_reaped < max {
+            // Use fi_cq_data_entry to match FI_CQ_FORMAT_DATA set at CQ creation.
+            let mut entries: [fi_cq_data_entry; BATCH] = unsafe { std::mem::zeroed() };
+            let want = BATCH.min(max - total_reaped);
             let read =
                 unsafe { fi_cq_read(self.completion_queue, entries.as_mut_ptr().cast(), want) };
             if 0 < read {
                 for entry in &entries[..read as usize] {
-                    out.push((non_null_context(entry.op_context)?, Ok(())));
+                    total_reaped += 1;
+                    // Remote ack completions: FI_REMOTE_CQ_DATA flag set, null op_context.
+                    // The `data` field contains the transfer_id the client echoed back.
+                    if entry.flags & u64::from(FI_REMOTE_CQ_DATA) != 0 {
+                        ack_out.push(entry.data as u32);
+                        continue;
+                    }
+                    // Local operation completions: non-null op_context.
+                    if !entry.op_context.is_null() {
+                        local_out.push((non_null_context(entry.op_context)?, Ok(())));
+                    }
                 }
             } else if read == again {
                 break; // nothing ready
             } else if read == available {
                 let (context, result) = self.read_error()?;
-                out.push((non_null_context(context)?, result));
+                local_out.push((non_null_context(context)?, result));
+                total_reaped += 1;
             } else {
                 return Err(fabric_error(read as i32, "fi_cq_read"));
             }
         }
         Ok(())
+    }
+
+    /// Poll the completion queue for remote write completions (`FI_REMOTE_CQ_DATA` entries).
+    ///
+    /// When a remote endpoint calls `post_out_with_immediate()`, the write generates a completion
+    /// entry on this endpoint's CQ with the `FI_REMOTE_CQ_DATA` flag set and the immediate data
+    /// in the `data` field. This method returns those immediate data values, allowing the caller
+    /// to know which remote writes have landed in their buffer.
+    ///
+    /// With the `efa` (rxr) provider and "unsolicited write recv" (default on libfabric 1.22+),
+    /// no posted receive buffers are needed to receive these completions.
+    ///
+    /// Returns up to `max` immediate data values from remote write completions.
+    ///
+    /// NOTE: Prefer `reap_all()` which handles both local and ack completions in one pass.
+    /// This method may miss local completions consumed by the same `fi_cq_read`.
+    pub fn poll_remote_completions(&self, max: usize) -> Result<Vec<u32>, DmaError> {
+        let mut local = Vec::new();
+        let mut acks = Vec::new();
+        self.reap_all(&mut local, &mut acks, max)?;
+        // Discard local completions — caller only wanted acks.
+        // This is wasteful; prefer reap_all() for the unified path.
+        Ok(acks)
     }
 
     /// Read one error completion, returning the failing op's `op_context` and the error. `Err` when
@@ -521,6 +661,10 @@ impl Drop for LibfabricEndpoint {
         // have to go before that vector is closed below.
         self.peer_addresses.clear();
         unsafe {
+            // Close the ack buffer MR before the domain — it's a domain object.
+            if !self.ack_buffer_mr.is_null() {
+                fi_close(&mut (*self.ack_buffer_mr).fid);
+            }
             if !self.endpoint.is_null() {
                 fi_close(&mut (*self.endpoint).fid);
             }
@@ -540,5 +684,7 @@ impl Drop for LibfabricEndpoint {
                 fi_freeinfo(self.info);
             }
         }
+        // The ack_buffer Box is dropped automatically after this, which is fine since
+        // the MR is already closed.
     }
 }

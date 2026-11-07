@@ -27,7 +27,7 @@ mod sys;
 
 pub use configuration::{Configuration, Provider};
 pub use devices::discover_domains;
-pub use endpoint::{EndpointInfo, LibfabricEndpoint};
+pub use endpoint::{AckBufferInfo, EndpointInfo, LibfabricEndpoint, ACK_MAGIC};
 pub use memory_region::MemoryRegion;
 pub use operands::{CacheableSpan, Operands};
 pub use peer_addresses::RegisteredAddress;

@@ -31,9 +31,18 @@ use crate::server::WorkerMessage;
 /// batch, and so one downstream lock acquisition, accumulates.
 const TARGET_COMPLETIONS: usize = 10;
 
+/// A ToPeer operation whose local write has completed but is still awaiting its ack from the client.
+/// Stored in `awaiting_ack` keyed by `transfer_id` until the matching ack arrives.
+struct AwaitingAck<T> {
+    /// The in-flight operation, already reaped from the local completion.
+    inflight: Box<InFlight<T>>,
+    /// The result from the local write completion (Ok or error).
+    write_result: Result<(), DmaError>,
+}
+
 pub fn worker_main<T: Operands + Send + 'static>(
     configuration: Configuration,
-    ready: Answer<Result<Vec<u8>, DmaError>>,
+    ready: Answer<Result<crate::server::EndpointReadyInfo, DmaError>>,
     receiver: &Receiver<WorkerMessage<T>>,
     complete_batch: Arc<BatchCompleter<T>>,
     pool: Arc<Pool>,
@@ -44,10 +53,11 @@ pub fn worker_main<T: Operands + Send + 'static>(
     let mut endpoint = match LibfabricEndpoint::open(&configuration, configuration.bind.as_deref())
         .and_then(|endpoint| {
             let address = endpoint.local_address()?;
-            Ok((endpoint, address))
+            let ack_buffer = endpoint.ack_buffer_info();
+            Ok((endpoint, address, ack_buffer))
         }) {
-        Ok((endpoint, address)) => {
-            ready.send(Ok(address));
+        Ok((endpoint, address, ack_buffer)) => {
+            ready.send(Ok(crate::server::EndpointReadyInfo { address, ack_buffer }));
             endpoint
         }
         Err(error) => {
@@ -76,6 +86,15 @@ pub fn worker_main<T: Operands + Send + 'static>(
     let mut crc_pending: Vec<ReapedOp<T>> = Vec::new();
     let mut drain_spins = 0;
 
+    // For ToPeer ops: track in-flight operations awaiting their ack by transfer_id.
+    // When the local write completes, we move the InFlight here until the ack arrives.
+    let mut awaiting_ack: HashMap<u32, AwaitingAck<T>> = HashMap::new();
+    // Acks that arrived before their local write completion (same CQ batch or earlier pass).
+    // Checked and removed in the reaped drain loop to avoid parking an already-acked op.
+    let mut early_acks: HashSet<u32> = HashSet::new();
+    // Ack completions received this pass (transfer_ids echoed back by clients).
+    let mut ack_completions: Vec<u32> = Vec::new();
+
     loop {
         // Intake: drain the channel without blocking.
         loop {
@@ -94,12 +113,23 @@ pub fn worker_main<T: Operands + Send + 'static>(
                 }) => {
                     reply.send(endpoint.insert_peer(client_id, &address).map(|_| ()));
                 }
-                Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
-                    &mut endpoint,
-                    &outstanding_by_client,
-                    &mut pending_removal,
-                    client_id,
-                ),
+                Ok(WorkerMessage::RemovePeer(client_id)) => {
+                    drain_client_acks(
+                        client_id,
+                        &mut awaiting_ack,
+                        &mut endpoint,
+                        &mut outstanding_by_client,
+                        &mut pending_removal,
+                        outstanding,
+                        &mut completions,
+                    );
+                    remove_or_defer(
+                        &mut endpoint,
+                        &outstanding_by_client,
+                        &mut pending_removal,
+                        client_id,
+                    );
+                }
                 // The submitter is blocked on this reply, so answer even when the pin fails.
                 Ok(WorkerMessage::Register {
                     base,
@@ -156,13 +186,45 @@ pub fn worker_main<T: Operands + Send + 'static>(
         }
 
         // Reap up to 10, then dispatch — bounding what one batch, and so one downstream lock
-        // acquisition, accumulates.
+        // acquisition, accumulates. Use reap_all to get both local completions and ack completions
+        // in one CQ pass.
         reaped.clear();
-        if let Err(error) = endpoint.reap(&mut reaped, TARGET_COMPLETIONS) {
+        ack_completions.clear();
+        if let Err(error) = endpoint.reap_all(&mut reaped, &mut ack_completions, TARGET_COMPLETIONS) {
             // Names no op, so no client can be failed for it. Keep serving: the ops it did yield are
             // in `reaped`, and the rest stay in flight for a later pass.
             tracing::warn!("completion queue read failed: {error}");
         }
+
+        // Process ack completions first: match them to ops awaiting ack by transfer_id.
+        for transfer_id in ack_completions.drain(..) {
+            if let Some(mut waiting) = awaiting_ack.remove(&transfer_id) {
+                // Got the ack, mark it and complete the operation.
+                waiting.inflight.ack_done = true;
+                tracing::info!(transfer_id, "ACK received, completing ToPeer op");
+                let inflight = waiting.inflight;
+                let result = waiting.write_result;
+                // Now we can finish the op and decrement the client's outstanding count.
+                finish_op(
+                    &mut endpoint,
+                    &mut outstanding_by_client,
+                    &mut pending_removal,
+                    outstanding,
+                    inflight.client_id,
+                );
+                if inflight.want_checksum {
+                    crc_pending.push((inflight, result));
+                } else {
+                    completions.push(inflight.into_completion(result));
+                }
+            } else {
+                // Ack arrived before the local write completion (same batch or earlier pass).
+                // Stash it so the reaped-drain loop can match it immediately.
+                tracing::debug!(transfer_id, "ack arrived before local completion, stashing");
+                early_acks.insert(transfer_id);
+            }
+        }
+
         // Saturating because a reap that outran `in_flight` would otherwise wrap and leave the
         // worker unable to post again — stalling every client on this device, silently.
         in_flight = in_flight.saturating_sub(reaped.len());
@@ -177,23 +239,59 @@ pub fn worker_main<T: Operands + Send + 'static>(
                 posted,
                 reaped = reaped.len(),
                 pending = pending.len(),
+                awaiting_ack = awaiting_ack.len(),
             );
         }
         for (context, result) in reaped.drain(..) {
-            let inflight = reclaim(context.cast::<InFlight<T>>());
-            finish_op(
-                &mut endpoint,
-                &mut outstanding_by_client,
-                &mut pending_removal,
-                outstanding,
-                inflight.client_id,
-            );
-            // Checksummed ops carry their CRC into the completion, so defer the whole completion to
-            // the pool rather than hash here. The rest are cheap enough to finish inline.
-            if inflight.want_checksum {
-                crc_pending.push((inflight, result));
+            let mut inflight = reclaim(context.cast::<InFlight<T>>());
+            inflight.write_done = true;
+
+            // For ToPeer ops with a transfer_id, wait for the ack before completing.
+            // For FromPeer ops (transfer_id == 0), complete immediately.
+            if inflight.transfer_id != 0 {
+                // ToPeer: check if the ack already arrived (same batch or earlier pass).
+                let transfer_id = inflight.transfer_id;
+                if early_acks.remove(&transfer_id) {
+                    // Ack beat the local completion — complete immediately.
+                    inflight.ack_done = true;
+                    tracing::info!(transfer_id, "ToPeer write done, early ack matched");
+                    finish_op(
+                        &mut endpoint,
+                        &mut outstanding_by_client,
+                        &mut pending_removal,
+                        outstanding,
+                        inflight.client_id,
+                    );
+                    if inflight.want_checksum {
+                        crc_pending.push((inflight, result));
+                    } else {
+                        completions.push(inflight.into_completion(result));
+                    }
+                } else {
+                    // Park in awaiting_ack until the client's ack arrives.
+                    tracing::info!(transfer_id, "ToPeer write done, awaiting ack");
+                    awaiting_ack.insert(transfer_id, AwaitingAck {
+                        inflight,
+                        write_result: result,
+                    });
+                    // Don't call finish_op yet — we'll do it when the ack arrives.
+                }
             } else {
-                completions.push(inflight.into_completion(result));
+                // FromPeer or no-ack path: complete immediately.
+                finish_op(
+                    &mut endpoint,
+                    &mut outstanding_by_client,
+                    &mut pending_removal,
+                    outstanding,
+                    inflight.client_id,
+                );
+                // Checksummed ops carry their CRC into the completion, so defer the whole completion to
+                // the pool rather than hash here. The rest are cheap enough to finish inline.
+                if inflight.want_checksum {
+                    crc_pending.push((inflight, result));
+                } else {
+                    completions.push(inflight.into_completion(result));
+                }
             }
         }
 
@@ -201,7 +299,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
             crc_pending.len(),
             posted,
             reaped_any,
-            pending.is_empty() && 0 == in_flight,
+            pending.is_empty() && 0 == in_flight && awaiting_ack.is_empty(),
         ) {
             submit_crc_batch(&pool, &complete_batch, std::mem::take(&mut crc_pending));
         }
@@ -217,10 +315,10 @@ pub fn worker_main<T: Operands + Send + 'static>(
             (*complete_batch)(completions.drain(..));
         }
 
-        if disconnected && pending.is_empty() && 0 == in_flight {
+        if disconnected && pending.is_empty() && 0 == in_flight && awaiting_ack.is_empty() {
             break;
         }
-        if 0 == in_flight && pending.is_empty() {
+        if 0 == in_flight && pending.is_empty() && awaiting_ack.is_empty() {
             // Nothing outstanding: block on the channel to release the core.
             match receiver.recv() {
                 Ok(WorkerMessage::Transfer(request)) => accept(
@@ -254,27 +352,34 @@ pub fn worker_main<T: Operands + Send + 'static>(
                 Err(_) => break, // channel closed and nothing left → shutdown
             }
         } else if 0 == posted && !reaped_any {
-            if 0 == in_flight {
+            if 0 == in_flight && awaiting_ack.is_empty() {
                 // Everything pending is stalled on -FI_EAGAIN, peers connecting or gone. There is
                 // nothing to reap, so busy-polling probably won't help much. Make sure the core is
                 // available to other work since it probably isn't useful here for at least a few
                 // hundred microseconds.
                 std::thread::yield_now();
             } else {
-                // Work in flight but nothing moved this pass: stay hot for the completion.
+                // Work in flight or awaiting acks but nothing moved this pass: stay hot for the completion.
                 std::hint::spin_loop();
             }
         }
     }
 
-    // Shutdown: fail never-posted requests and finish deferred checksummed completions inline, since
-    // the pool may be tearing down alongside us.
+    // Shutdown: fail never-posted requests, ops awaiting ack, and finish deferred checksummed
+    // completions inline, since the pool may be tearing down alongside us.
     let mut leftover: Vec<Completion<T>> = pending
         .drain(..)
         .map(|prepared| {
             let error = DmaError::Fabric("fabric worker is gone".into());
             reclaim(prepared.context).into_completion(Err(error))
         })
+        .chain(
+            // Ops awaiting ack that never got one — complete them with their write result.
+            // The ack never came, but the write itself may have succeeded.
+            awaiting_ack
+                .drain()
+                .map(|(_, waiting)| waiting.inflight.into_completion(waiting.write_result)),
+        )
         .chain(
             crc_pending
                 .into_iter()
@@ -345,6 +450,38 @@ fn remove_or_defer(
         endpoint.release_peer(client_id);
     } else {
         pending_removal.insert(client_id);
+    }
+}
+
+/// Drain `awaiting_ack` entries belonging to a disconnected client. Completes each op with its
+/// write result (the write succeeded, but the ack will never arrive) and decrements the client's
+/// outstanding count so `remove_or_defer` can release the peer.
+fn drain_client_acks<T: Operands>(
+    client_id: u64,
+    awaiting_ack: &mut HashMap<u32, AwaitingAck<T>>,
+    endpoint: &mut LibfabricEndpoint,
+    outstanding_by_client: &mut HashMap<u64, usize>,
+    pending_removal: &mut HashSet<u64>,
+    outstanding: &AtomicUsize,
+    completions: &mut Vec<Completion<T>>,
+) {
+    let drain_ids: Vec<u32> = awaiting_ack
+        .iter()
+        .filter(|(_, w)| w.inflight.client_id == client_id)
+        .map(|(&id, _)| id)
+        .collect();
+    for id in drain_ids {
+        if let Some(waiting) = awaiting_ack.remove(&id) {
+            tracing::info!(transfer_id = id, client_id, "draining ack for disconnected client");
+            finish_op(
+                endpoint,
+                outstanding_by_client,
+                pending_removal,
+                outstanding,
+                client_id,
+            );
+            completions.push(waiting.inflight.into_completion(waiting.write_result));
+        }
     }
 }
 
@@ -424,7 +561,18 @@ fn post<T: Operands>(
                 // SAFETY: the operand lives in the caller context, which the `InFlight` holds until
                 //         the completion runs.
                 let bytes = unsafe { std::slice::from_raw_parts(prepared.pointer, length) };
-                connection.post_out(bytes, descriptor, context)
+                // Use post_out_with_immediate to send FI_REMOTE_CQ_DATA with the write.
+                // The immediate data is a unique transfer_id so the client can echo it back
+                // in its ack for correlation. With the `efa` (rxr) provider, this generates a CQ
+                // entry at the client without requiring posted receive buffers.
+                let transfer_id = endpoint.next_transfer_id();
+                // Store the transfer_id in InFlight so we can match incoming acks to this write.
+                // SAFETY: `prepared.context` is this operation's live `InFlight`, and nothing else
+                //         touches it until the completion.
+                unsafe {
+                    (*prepared.context).transfer_id = transfer_id;
+                }
+                connection.post_out_with_immediate(bytes, descriptor, context, transfer_id)
             }
             Direction::FromPeer { .. } => {
                 // SAFETY: as above; no other thread touches the buffer until completion.
@@ -492,6 +640,15 @@ struct InFlight<T> {
     wire_span: tracing::Span,
     /// Child of `wire_span` covering only the wait, from `fi_*` returning to the completion reaped.
     await_span: tracing::Span,
+    /// The unique transfer ID sent as immediate data in `ToPeer` writes. The client echoes this
+    /// back in its ack, allowing correlation. 0 for `FromPeer` or when no ack is expected.
+    transfer_id: u32,
+    /// True once the local write completion has been reaped (data transmitted to client).
+    /// For `FromPeer` ops this is the only completion needed.
+    write_done: bool,
+    /// True once the client's ack with matching `transfer_id` has been received.
+    /// Only meaningful for `ToPeer` ops; `FromPeer` ops don't wait for acks.
+    ack_done: bool,
 }
 
 // SAFETY: moved to a pool worker to finish a checksummed completion. Its raw pointers reference the
@@ -566,6 +723,11 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
         local_lease: None,
         wire_span: tracing::Span::none(),
         await_span: tracing::Span::none(),
+        // Set at post time for ToPeer writes; 0 for FromPeer.
+        transfer_id: 0,
+        // Completion tracking: both start false, set true as completions arrive.
+        write_done: false,
+        ack_done: false,
     });
     let operand = match request.direction {
         Direction::ToPeer => match inflight.caller_context.source() {
